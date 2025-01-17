@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt 
 import pandas as pd
 from memory_profiler import profile
+from lifelines import KaplanMeierFitter, ExponentialFitter
 
 class KaplanMeier:
     def __init__(self, dataset, time_column, event_column):
@@ -12,16 +13,15 @@ class KaplanMeier:
         self.event_times = np.sort(dataset[time_column][dataset[event_column] == 1].unique())
         self.survival_probabilities = self.get_survival_probabilities()
 
-    @profile
     def get_survival_probabilities(self):
         survival_probabilities = []
         n = len(self.dataset)
 
          # Handle first time point separately
         t = self.times[0]
-        n_t = len(self.dataset[self.dataset[self.time_column] >= t])
-        d_t = len(self.dataset[(self.dataset[self.time_column] == t) & (self.dataset[self.event_column] == 1)])
-        prob_of_death = d_t/n_t if n_t > 0 else 0
+        #n_t = len(self.dataset[self.dataset[self.time_column] >= t])
+        #d_t = len(self.dataset[(self.dataset[self.time_column] == t) & (self.dataset[self.event_column] == 1)])
+        prob_of_death = 0 
         survival_probabilities.append(1 - prob_of_death)  # First probability
 
         for t in self.times[1:]:
@@ -33,11 +33,12 @@ class KaplanMeier:
         return survival_probabilities
 
     def plot(self):
+        plt.figure(1)
         plt.step(self.times, self.survival_probabilities, where='post')
         plt.xlabel('Time')
         plt.ylabel('Survival Probability')
         plt.title('Kaplan-Meier Curve')
-        plt.show()
+        plt.savefig('KaplanMeierByHand.png')
 
 dataset = pd.read_csv('/Users/rbhalerao/Desktop/CPH200B/heart_failure_clinical_records_dataset.csv')
 km = KaplanMeier(dataset=dataset, 
@@ -46,3 +47,17 @@ km = KaplanMeier(dataset=dataset,
 
 # Generate the plot
 km.plot()
+
+plt.figure(2)
+#Using lifelines package
+kmf = KaplanMeierFitter()
+kmf.fit(durations=dataset['time'], event_observed=dataset['DEATH_EVENT'])
+kmf.survival_function_
+kmf.cumulative_density_
+kmf.plot_survival_function()
+plt.savefig('KaplanMeierByLifelines.png')
+
+plt.figure(3)
+exf = ExponentialFitter().fit(durations=dataset['time'], event_observed=dataset['DEATH_EVENT'], label='ExponentialFitter')
+exf.plot_survival_function()
+plt.savefig('ExponentialFitter.png')
