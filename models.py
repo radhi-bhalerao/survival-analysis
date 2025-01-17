@@ -1,6 +1,7 @@
 import numpy as np 
 import matplotlib.pyplot as plt 
 import pandas as pd
+from memory_profiler import profile
 
 class KaplanMeier:
     def __init__(self, dataset, time_column, event_column):
@@ -11,6 +12,7 @@ class KaplanMeier:
         self.event_times = np.sort(dataset[time_column][dataset[event_column] == 1].unique())
         self.survival_probabilities = self.get_survival_probabilities()
 
+    @profile
     def get_survival_probabilities(self):
         survival_probabilities = []
         n = len(self.dataset)
