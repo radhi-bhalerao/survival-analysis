@@ -45,3 +45,6 @@ MKNN_model.fit(features)
 
 # Predict survival curves for the first 5 observations
 survival_curves = MKNN_model.plot_survival_curves(MKNN_model.test[0:5], title="Survival Curves for Test Data")
+
+c_index = MKNN_model.calculate_concordance_index(MKNN_model.test, verbose=True)
+print(c_index)
