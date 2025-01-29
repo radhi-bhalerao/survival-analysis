@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt 
 import pandas as pd
 from memory_profiler import profile
-from lifelines import KaplanMeierFitter, ExponentialFitter
+from lifelines import KaplanMeierFitter, ExponentialFitter, concordance_index
 from scipy.optimize import minimize
 
 class KaplanMeier:
@@ -86,7 +86,6 @@ class ExponentialSurvivalCurve:
         plt.ylabel('Survival Probability')
         plt.title('Exponential Parametric Survival Curve')
         plt.savefig('ExponentialParametricSurvivalCurve.png')
-
 
 class MahalanobisKNearestNeighbor:
     def __init__(self, dataset, time_column, event_column, k):
@@ -233,47 +232,38 @@ class MahalanobisKNearestNeighbor:
         plt.ylim(0, 1.05)
         plt.savefig('MahalanobisKNearestNeighbor.png')
         return plt
-    
+    def calculate_concordance_index(self, X_test, verbose=False):
+        """
+        Calculate the concordance index (C-index) for the model
+        
+        Parameters:
+        X_test: DataFrame of test data including time and event columns
+        verbose: If True, print additional information
+        
+        Returns:
+        float: C-index score
+        """
+        # Get survival probabilities for test data
+        survival_curves = self.predict(X_test.drop(columns=[self.time_column, self.event_column]))
+        
+        # Get the actual times and events from test data
+        actual_times = X_test[self.time_column].values
+        actual_events = X_test[self.event_column].values
+        
+        # Calculate risk scores as negative of the area under the survival curve
+        # (higher risk = lower survival probability)
+        risk_scores = [-np.trapz(curve, self.times) for curve in survival_curves]
+        
+        # Calculate C-index
+        c_index = concordance_index(actual_times, 
+                                  -np.array(risk_scores),  # Negative because higher risk = lower survival
+                                  actual_events)
+        
+        if verbose:
+            print(f"Concordance Index: {c_index:.3f}")
+            print("Note: C-index of 0.5 indicates random predictions")
+            print("      C-index of 1.0 indicates perfect ranking")
+        
+        return c_index
 
-
-    
-
-#Loading the dataset    
-dataset = pd.read_csv('/Users/rbhalerao/Desktop/CPH200B/heart_failure_clinical_records_dataset.csv')
-
-km = KaplanMeier(dataset=dataset, 
-                 time_column='time', 
-                 event_column='DEATH_EVENT')
-
-# Generate the plot
-km.plot()
-
-plt.figure(2)
-#Using lifelines package
-kmf = KaplanMeierFitter()
-kmf.fit(durations=dataset['time'], event_observed=dataset['DEATH_EVENT'])
-kmf.survival_function_
-kmf.cumulative_density_
-kmf.plot_survival_function()
-plt.savefig('KaplanMeierByLifelines.png')
-
-plt.figure(3)
-exf = ExponentialFitter().fit(durations=dataset['time'], event_observed=dataset['DEATH_EVENT'], label='ExponentialFitter')
-exf.plot_survival_function()
-plt.savefig('ExponentialFitter.png')
-
-plt.figure(4)
-exp = ExponentialSurvivalCurve(dataset=dataset,time_column='time',  event_column='DEATH_EVENT')
-exp.plot()
-
-
-#Mahalanobis K-Nearest Neighbors
-features = dataset.drop(columns=['time', 'DEATH_EVENT'])
-
-# Create and fit the model
-MKNN_model = MahalanobisKNearestNeighbor(dataset, 'time', 'DEATH_EVENT', k=5)
-MKNN_model.fit(features)
-
-# Predict survival curves for the first 5 observations
-survival_curves = MKNN_model.plot_survival_curves(MKNN_model.test[0:5], title="Survival Curves for Test Data")
-
+  
