@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, TensorDataset 
 
 class SurvivalDataset(Dataset):
     """Dataset class for survival data"""
@@ -19,19 +19,79 @@ class SurvivalDataset(Dataset):
         self.events = events
     
     def __len__(self):
-        return len(self.X)
+        return len(self.X.columns)
     
     def __getitem__(self, idx):
         return self.X[idx], self.durations[idx], self.events[idx]
     
-    def normalize(self):
-        """Normalize input features"""
-        copy = self.X.copy()
-        for every_column in copy.columns:
-            unique_vals = set(copy[every_column].unique())
+    def get_features(self):
+        return self.X.drop(columns=[self.durations, self.events]).columns.values
+    
+    @classmethod
+    def split_dataset(cls, dataset, durations, events, test_size=0.2, val_size=0.2, random_state=None):
+        """
+        Split the dataset into train, validation, and test sets
+        
+        Args:
+        - dataset (SurvivalDataset): Original dataset
+        - test_size (float): Proportion of data to use for testing
+        - val_size (float): Proportion of training data to use for validation
+        - random_state (int): Random seed for reproducibility
+        
+        Returns:
+        - Tuple of SurvivalDataset instances (train, val, test)
+        """
+        # Set random seed if provided
+        if random_state is not None:
+            np.random.seed(random_state)
+        
+        # Total number of samples
+        total_samples = len(dataset.X)
+        print(total_samples)
+        # Generate indices for splitting
+        indices = np.random.permutation(total_samples)
+        
+        # Calculate split indices
+        test_split = int(total_samples * test_size)
+        train_val_split = total_samples - test_split
+        val_split = int(train_val_split * val_size)
+        train_split = train_val_split - val_split
+        
+        # Split indices
+        train_indices = indices[:train_split]
+        val_indices = indices[train_split:train_val_split]
+        test_indices = indices[train_val_split:]
+        
+        print(len(train_indices), len(val_indices), len(test_indices))
+        norm_copy = dataset.X.copy()
+        features = norm_copy.drop(columns=[dataset.durations, dataset.events]).columns
+        #print(copy.columns)
+        for every_column in features:
+            unique_vals = set(norm_copy[every_column].unique())
             if unique_vals != {0, 1}:
-                copy[every_column] = (copy[every_column] - copy[every_column].mean()) / copy[every_column].std()
-        return copy
+                norm_copy[every_column] = (norm_copy[every_column] - norm_copy[every_column].mean()) / norm_copy[every_column].std()
+        norm_copy.drop(columns=[dataset.durations, dataset.events])
+
+       # Create new datasets
+        train_dataset = cls(
+            norm_copy.iloc[train_indices], 
+            dataset.X[durations].iloc[train_indices], 
+            dataset.X[durations].iloc[train_indices]
+        )
+        
+        val_dataset = cls(
+            norm_copy.iloc[val_indices], 
+            dataset.X[durations].iloc[val_indices], 
+            dataset.X[durations].iloc[val_indices]
+        )
+        
+        test_dataset = cls(
+            norm_copy.iloc[test_indices], 
+            dataset.X[durations].iloc[test_indices], 
+            dataset.X[events].iloc[test_indices]
+        )
+        
+        return train_dataset, val_dataset, test_dataset
     
 class KaplanMeier:
     def __init__(self, dataset, time_column, event_column):
@@ -299,75 +359,93 @@ class CoxPHModel(nn.Module):
     def __init__(self, input_dim):
         super(CoxPHModel, self).__init__()
         self.linear = nn.Linear(input_dim, 1, bias=False)
-        self.scaler = StandardScaler()
+        #self.scaler = StandardScaler()
         self.loss_history = {'train': [], 'val': []}
-        
     def forward(self, x):
         return self.linear(x)
     
     def _negative_log_partial_likelihood(self, risk_scores, durations, events):
-        ordered_idx = torch.argsort(durations, descending=True)
-        risk_scores = risk_scores[ordered_idx]
+        # Sort by durations in descending order
+        ordered_idx = np.argsort(durations)
+        
+        # Reorder risk_scores and events according to sorted durations
+       
+        risk_scores = risk_scores[ordered_idx] #beta*features
         events = events[ordered_idx]
+        durations = durations[ordered_idx]
         
-        # Calculate cumulative sum of risk scores
-        cumsum_risk = torch.cumsum(risk_scores, dim=0)
-        
-        # Calculate log-sum-exp using the log-sum-exp trick
-        max_risk = torch.max(risk_scores)
-        log_risk = max_risk + torch.log(torch.cumsum(torch.exp(risk_scores - max_risk), dim=0))
+        # Calculate cumulative sum of exp(risk_scores)
+        exp_risk_scores = torch.exp(risk_scores)
+        #print(exp_risk_scores)
+        cumsum_exp_risk = torch.cumsum(exp_risk_scores.flip(0), dim=0).flip(0)
+        #print(cumsum_exp_risk)
         
         # Calculate individual likelihood contributions
-        likelihood = risk_scores - log_risk
-        
+        log_risk = torch.log(cumsum_exp_risk + 1e-8)  # Log of cumulative sum of risk scores at each time
+        likelihood = risk_scores - log_risk  # Individual likelihood at each time
+        #print(likelihood)
         # Zero out censored observations
         uncensored_likelihood = likelihood * events
-        
+        #print(uncensored_likelihood)
         # Calculate negative log likelihood
         logL = -torch.sum(uncensored_likelihood)
+        #print(logL)
         
-        # Normalize by number of events
+        # Normalize by number of events (non-censored)
         num_events = torch.sum(events)
-        return logL / (num_events + 1e-8)
+        #print(num_events)
+        
+        risk_scores = logL / (num_events)  + 1e-8 # Add a small epsilon to avoid division by zero
 
-    def prepare_data(self, df, feature_cols, duration_col, event_col, test_size=0.20, random_state=42):
-        """Prepare and split data"""
-        train_df, test_df = train_test_split(df, test_size=test_size, random_state=random_state)
-        
-        X_train = self.scaler.fit_transform(train_df[feature_cols])
-        X_test = self.scaler.transform(test_df[feature_cols])
-        
-        X_train = torch.FloatTensor(X_train)
-        X_test = torch.FloatTensor(X_test)
-        durations_train = torch.FloatTensor(train_df[duration_col].values)
-        durations_test = torch.FloatTensor(test_df[duration_col].values)
-        events_train = torch.FloatTensor(train_df[event_col].values)
-        events_test = torch.FloatTensor(test_df[event_col].values)
-        
-        train_dataset = SurvivalDataset(X_train, durations_train, events_train)
-        test_dataset = SurvivalDataset(X_test, durations_test, events_test)
-        
-        return train_dataset, test_dataset
-    
+        if num_events == 0:
+            print("Warning: num_events is zero!")
+             # Skip this batch or handle it in some other way
+
+        return risk_scores # Add a small epsilon to avoid division by zero
+
     def fit(self, df, feature_cols, duration_col, event_col, 
-            batch_size=32, learning_rate=0.01, num_epochs=1000,
-            test_size=0.2, random_state=42, verbose=True):
+        batch_size=64, learning_rate=0.005, num_epochs=150,
+        test_size=0.2, val_size=0.2, random_state=42, verbose=True):
         """Fit the model using batch training"""
         self.loss_history = {'train': [], 'val': []}
+        self.loss_history_detailed = {'train': [], 'val': [], 'epoch': []}
         
-        # Prepare data with batching
-        train_dataset, test_dataset = self.prepare_data(
-            df, feature_cols, duration_col, event_col, test_size, random_state
+        # Prepare data
+        train_dataset, val_dataset, test_dataset = SurvivalDataset.split_dataset(df, duration_col, event_col, test_size=0.2, val_size=0.2, random_state=142)
+        print(f"Train dataset size: {len(train_dataset.X)}")
+        print(f"Validation dataset size: {len(val_dataset.X)}")
+        print(f"Test dataset size: {len(test_dataset.X)}")
+        #print(train_dataset.X.values)
+        # Convert to TensorDataset (assuming you want to use PyTorch tensors)
+        train_loader = DataLoader(
+            TensorDataset(
+                torch.tensor(train_dataset.X.values, dtype=torch.float32),
+                torch.tensor(train_dataset.durations, dtype=torch.float32),
+                torch.tensor(train_dataset.events, dtype=torch.float32)
+            ), 
+            batch_size=23, 
+            shuffle=False, drop_last=True
         )
-        
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        test_loader = DataLoader(test_dataset, batch_size=len(test_dataset))
-        
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=0.9)
+
+        val_loader = DataLoader(
+            TensorDataset(
+                torch.tensor(val_dataset.X.values, dtype=torch.float32),
+                torch.tensor(val_dataset.durations.values, dtype=torch.float32),
+                torch.tensor(val_dataset.events.values, dtype=torch.float32)
+            ), 
+            batch_size=23, 
+        )
+
+        test_loader = DataLoader(
+            TensorDataset(
+                torch.tensor(test_dataset.X.values, dtype=torch.float32),
+                torch.tensor(test_dataset.durations.values, dtype=torch.float32),
+                torch.tensor(test_dataset.events.values, dtype=torch.float32)
+            ), 
+            batch_size=23
+        )
+                
         optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=50, verbose=verbose, min_lr=1e-6
-        )
         
         best_val_loss = float('inf')
         best_weights = None
@@ -376,7 +454,7 @@ class CoxPHModel(nn.Module):
         
         for epoch in range(num_epochs):
             # Training
-            self.train()
+            #self.train()
             train_losses = []
             for batch_X, batch_durations, batch_events in train_loader:
                 optimizer.zero_grad()
@@ -385,14 +463,15 @@ class CoxPHModel(nn.Module):
                     risk_scores, batch_durations, batch_events
                 )
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
                 optimizer.step()
                 train_losses.append(loss.item())
-            
+                
             # Validation
             self.eval()
             with torch.no_grad():
                 val_losses = []
-                for batch_X, batch_durations, batch_events in test_loader:
+                for batch_X, batch_durations, batch_events in val_loader:
                     risk_scores = self(batch_X)
                     val_loss = self._negative_log_partial_likelihood(
                         risk_scores, batch_durations, batch_events
@@ -403,10 +482,7 @@ class CoxPHModel(nn.Module):
             avg_val_loss = np.mean(val_losses)
             self.loss_history['train'].append(avg_train_loss)
             self.loss_history['val'].append(avg_val_loss)
-            
-            # Learning rate scheduling
-            scheduler.step(avg_val_loss)
-            
+
             # Early stopping check
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
@@ -416,21 +492,26 @@ class CoxPHModel(nn.Module):
                 patience_counter += 1
             
             if patience_counter >= patience:
-                #print(f"Early stopping at epoch {epoch}")
+                print(f"Early stopping at epoch {epoch}")
                 break
+
+            print(f"Risk scores: {risk_scores}")
+
             
-            if verbose and (epoch + 1) % 100 == 0:
-                c_index = self.evaluate_batch(test_loader)
+            if verbose and (epoch + 1) % 5 == 0:
+                val_c_index = self.evaluate_batch(val_loader)
+                test_c_index = self.evaluate_batch(test_loader)
                 print(f'Epoch [{epoch+1}/{num_epochs}]')
                 print(f'Train Loss: {avg_train_loss:.4f}')
                 print(f'Val Loss: {avg_val_loss:.4f}')
-                print(f'Val C-index: {c_index:.4f}')
+                print(f'Val C-index: {val_c_index:.4f}')
+                print(f'Test C-index: {test_c_index:.4f}')
                 print(f'Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}\n')
+
+            # Load best weights
+            if best_weights is not None:
+                self.load_state_dict(best_weights)
         
-        # Load best weights
-        if best_weights is not None:
-            self.load_state_dict(best_weights)
-    
     def evaluate_batch(self, data_loader):
         """Evaluate model performance using concordance index"""
         self.eval()
@@ -523,8 +604,6 @@ class CoxPHModel(nn.Module):
         Returns:
             numpy.ndarray: Predicted risk scores
         """
-        if isinstance(X, pd.DataFrame):
-            X = self.scaler.transform(X)
         X = torch.FloatTensor(X)
         self.eval()
         with torch.no_grad():

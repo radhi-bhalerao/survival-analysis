@@ -52,10 +52,9 @@ print(c_index)
 '''
 
 heart_failure_dataset = SurvivalDataset(dataset, 'time', 'DEATH_EVENT')
-normalized_dataset = heart_failure_dataset.normalize()
-print(normalized_dataset['creatinine_phosphokinase'])
-features = normalized_dataset.drop(columns=['time', 'DEATH_EVENT'])
-Cox_model = CoxPHModel(len(features.columns))
-Cox_model.fit(normalized_dataset, features.columns, 'time', 'DEATH_EVENT', batch_size = 64, learning_rate=0.005, num_epochs=150)
-#Cox_model.report_results(feature_names=features.columns)
+#print(heart_failure_dataset.X.columns)
+Cox_model = CoxPHModel(heart_failure_dataset.__len__())
+Cox_model.fit(heart_failure_dataset, heart_failure_dataset.get_features(), 'time', 'DEATH_EVENT', batch_size = 64, learning_rate=0.001, num_epochs=100)
+Cox_model.report_results(feature_names=heart_failure_dataset.get_features())
 Cox_model.plot_loss_curve()
+
