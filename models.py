@@ -10,6 +10,7 @@ import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import Dataset, DataLoader, TensorDataset 
+from sklearn.linear_model import LogisticRegression
 
 class SurvivalDataset(Dataset):
     """Dataset class for survival data"""
@@ -25,7 +26,8 @@ class SurvivalDataset(Dataset):
         return self.X[idx], self.durations[idx], self.events[idx]
     
     def get_features(self):
-        return self.X.drop(columns=[self.durations, self.events]).columns.values
+        feature_dx = self.X.drop(columns=[self.durations, self.events])
+        return feature_dx.columns.values
     
     @classmethod
     def split_dataset(cls, dataset, durations, events, test_size=0.2, val_size=0.2, random_state=None):
@@ -70,8 +72,8 @@ class SurvivalDataset(Dataset):
             unique_vals = set(norm_copy[every_column].unique())
             if unique_vals != {0, 1}:
                 norm_copy[every_column] = (norm_copy[every_column] - norm_copy[every_column].mean()) / norm_copy[every_column].std()
-        norm_copy.drop(columns=[dataset.durations, dataset.events])
-
+        norm_copy = norm_copy.drop(columns=[dataset.durations, dataset.events])
+        print(norm_copy.columns)
        # Create new datasets
         train_dataset = cls(
             norm_copy.iloc[train_indices], 
@@ -405,25 +407,25 @@ class CoxPHModel(nn.Module):
 
     def fit(self, df, feature_cols, duration_col, event_col, 
         batch_size=64, learning_rate=0.005, num_epochs=150,
-        test_size=0.2, val_size=0.2, random_state=42, verbose=True):
+        test_size=0.2, val_size=0.2, random_state=100, verbose=True):
         """Fit the model using batch training"""
         self.loss_history = {'train': [], 'val': []}
         self.loss_history_detailed = {'train': [], 'val': [], 'epoch': []}
         
         # Prepare data
-        train_dataset, val_dataset, test_dataset = SurvivalDataset.split_dataset(df, duration_col, event_col, test_size=0.2, val_size=0.2, random_state=142)
-        print(f"Train dataset size: {len(train_dataset.X)}")
-        print(f"Validation dataset size: {len(val_dataset.X)}")
-        print(f"Test dataset size: {len(test_dataset.X)}")
+        train_dataset, val_dataset, test_dataset = SurvivalDataset.split_dataset(df, duration_col, event_col, test_size, val_size, random_state=100)
+        #print(f"Train dataset size: {train_dataset.events.sum()}")
+        #print(f"Validation dataset size: {len(val_dataset.X.columns)}")
+        #print(f"Test dataset size: {len(test_dataset.X.columns)}")
         #print(train_dataset.X.values)
-        # Convert to TensorDataset (assuming you want to use PyTorch tensors)
+        # Convert to TensorDataset 
         train_loader = DataLoader(
             TensorDataset(
                 torch.tensor(train_dataset.X.values, dtype=torch.float32),
-                torch.tensor(train_dataset.durations, dtype=torch.float32),
-                torch.tensor(train_dataset.events, dtype=torch.float32)
+                torch.tensor(train_dataset.durations.values, dtype=torch.float32),
+                torch.tensor(train_dataset.events.values, dtype=torch.float32)
             ), 
-            batch_size=23, 
+            batch_size, 
             shuffle=False, drop_last=True
         )
 
@@ -433,7 +435,7 @@ class CoxPHModel(nn.Module):
                 torch.tensor(val_dataset.durations.values, dtype=torch.float32),
                 torch.tensor(val_dataset.events.values, dtype=torch.float32)
             ), 
-            batch_size=23, 
+            batch_size, 
         )
 
         test_loader = DataLoader(
@@ -442,7 +444,7 @@ class CoxPHModel(nn.Module):
                 torch.tensor(test_dataset.durations.values, dtype=torch.float32),
                 torch.tensor(test_dataset.events.values, dtype=torch.float32)
             ), 
-            batch_size=23
+            batch_size
         )
                 
         optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
@@ -495,15 +497,17 @@ class CoxPHModel(nn.Module):
                 print(f"Early stopping at epoch {epoch}")
                 break
 
-            print(f"Risk scores: {risk_scores}")
+            #print(f"Risk scores: {risk_scores}")
 
             
             if verbose and (epoch + 1) % 5 == 0:
+                train_c_index = self.evaluate_batch(train_loader)
                 val_c_index = self.evaluate_batch(val_loader)
                 test_c_index = self.evaluate_batch(test_loader)
                 print(f'Epoch [{epoch+1}/{num_epochs}]')
                 print(f'Train Loss: {avg_train_loss:.4f}')
                 print(f'Val Loss: {avg_val_loss:.4f}')
+                print(f'Train C-index: {train_c_index:.4f}')
                 print(f'Val C-index: {val_c_index:.4f}')
                 print(f'Test C-index: {test_c_index:.4f}')
                 print(f'Learning Rate: {optimizer.param_groups[0]["lr"]:.6f}\n')
@@ -609,3 +613,396 @@ class CoxPHModel(nn.Module):
         with torch.no_grad():
             risk_scores = self(X)
         return risk_scores.numpy()
+    
+class DeepSurv(nn.Module):
+    def __init__(self, n_in, hidden_layers_sizes=None, activation='relu', dropout=None, lr=0.001):
+        super(DeepSurv, self).__init__()
+        
+        if hidden_layers_sizes is None:
+            hidden_layers_sizes = [64, 32]
+        
+        layers = []
+        prev_size = n_in
+        for size in hidden_layers_sizes:
+            layers.append(nn.Linear(prev_size, size))
+            if activation == 'relu':
+                layers.append(nn.ReLU())
+            elif activation == 'selu':
+                layers.append(nn.SELU())
+            if dropout is not None:
+                layers.append(nn.Dropout(dropout))
+            prev_size = size
+        
+        layers.append(nn.Linear(prev_size, 1))
+        self.network = nn.Sequential(*layers)
+        
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr, weight_decay=1e-5)
+    
+    def forward(self, x):
+        return self.network(x)
+    
+    def _negative_log_likelihood(self, risk, E, T):
+        sorted_indices = torch.argsort(T)
+        T_sorted = T[sorted_indices]
+        E_sorted = E[sorted_indices]
+        risk_sorted = risk[sorted_indices]
+
+        hazard_ratio = torch.exp(risk_sorted)
+        log_risk = torch.log(torch.cumsum(hazard_ratio,0) + 1e-8)
+        uncensored_likelihood = risk_sorted - log_risk
+        censored_likelihood = uncensored_likelihood * E_sorted
+        num_observed_events = torch.sum(E_sorted)
+        # Including time factor (T) to model the risk more effectively
+        likelihood = censored_likelihood * T_sorted
+        return -torch.sum(likelihood) / num_observed_events + 1e-8
+
+    def concordance_index(self, T, C, risk):
+        """
+        Compute the C-index for the given true event times (T) and predicted risks (log-hazard scores).
+        
+        Parameters:
+        - T: True event times (1D array)
+        - C: Event indicator (1D array: 1 if event occurred, 0 if censored)
+        - risk: Predicted risk scores (1D array: predicted log-hazard ratios)
+        
+        Returns:
+        - C-index score
+        """
+        #print(f"True event times shape: {T.shape}")
+        #print(f"Predicted risk shape: {risk.shape}")
+
+        # Convert numpy arrays to PyTorch tensors
+        if isinstance(T, np.ndarray):
+            T = torch.tensor(T, dtype=torch.float32)  # Convert to tensor if it's a numpy array
+        if isinstance(C, np.ndarray):
+            C = torch.tensor(C, dtype=torch.float32)  # Convert to tensor if it's a numpy array
+        if isinstance(risk, np.ndarray):
+            risk = torch.tensor(risk, dtype=torch.float32)  # Convert to tensor if it's a numpy array
+        
+        # Detach tensors to get rid of the computation graph (if needed)
+        T = T.detach().cpu().numpy()
+        C = C.detach().cpu().numpy()
+        risk = risk.squeeze().detach().cpu().numpy()  # Flatten and remove unnecessary dimension
+
+        return concordance_index(T, risk, C)
+
+    def predict_risk(self, X):
+        X = torch.FloatTensor(X)
+        with torch.no_grad():
+            risk = self(X)
+        return risk.numpy()
+    def fit(self, X, T, C, X_val=None, T_val=None, C_val=None, epochs=80, batch_size=1800):
+        X = torch.FloatTensor(X)
+        T = torch.FloatTensor(T)
+        C = torch.FloatTensor(C)
+        
+        dataset = torch.utils.data.TensorDataset(X, T, C)
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=True)
+        
+        train_losses = []
+        val_losses = []
+        
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', patience=10, verbose=True)
+        train_cindex = []
+        val_cindex = []
+        train_allrisk = []
+        train_full_cindex_score = []
+        for epoch in range(epochs):
+            self.train()
+            epoch_loss = 0.0
+            for batch_X, batch_T, batch_C in dataloader:
+                #print(f"Epoch {epoch}, Size = {len(batch_X)}")
+                self.optimizer.zero_grad()
+                risk = self(batch_X)
+                loss = self._negative_log_likelihood(risk, batch_C, batch_T)
+                loss.backward()
+                self.optimizer.step()
+                epoch_loss += loss.item()
+            
+            epoch_loss /= len(dataloader)
+            train_losses.append(epoch_loss)
+            #train_allrisk.append(risk)
+            # Compute C-index for the current batch
+            train_cindex_score = self.concordance_index(batch_T, batch_C, risk)
+            train_cindex.append(train_cindex_score)
+            
+            if X_val is not None and T_val is not None and C_val is not None:
+                self.eval()
+                with torch.no_grad():
+                    val_risk = self(torch.FloatTensor(X_val))
+                    val_loss = self._negative_log_likelihood(val_risk, torch.FloatTensor(C_val), torch.FloatTensor(T_val))
+                    val_losses.append(val_loss.item())
+
+                    # Compute C-index for validation set
+                    val_cindex_score = self.concordance_index(T_val, C_val, val_risk)
+                    val_cindex.append(val_cindex_score)
+                
+                scheduler.step(val_loss)  # Step the scheduler after each epoch
+        
+                print(f"Epoch {epoch+1}/{epochs}, Train Loss: {epoch_loss:.4f}, Val Loss: {val_loss:.4f}, "
+                            f"Val C-index: {val_cindex_score:.4f}")
+            else:
+                print(f"Epoch {epoch+1}/{epochs}, Train Loss: {epoch_loss:.4f}")
+        
+        self.plot_loss(train_losses, val_losses, train_cindex, val_cindex)
+
+
+    def predict(self, X):
+        X = torch.FloatTensor(X)
+        with torch.no_grad():
+            risk = self(X)
+        
+        time_points = np.arange(0, 121, 6)  # 0 to 120 months (10 years) with 6-month increments
+        survival_probabilities = np.exp(-np.exp(risk.numpy()) * time_points[:, None].T)
+        
+        return survival_probabilities
+    
+    def plot_loss(self, train_losses, val_losses, train_c_index, val_c_index):
+        # Create a figure with 1 row and 2 columns for two subplots
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+        # Plot Loss
+        ax1.plot(train_losses, label='Training Loss')
+        ax1.plot(val_losses, label='Validation Loss')
+        ax1.set_title('Training and Validation Loss')
+        ax1.set_xlabel('Epochs')
+        ax1.set_ylabel('Loss')
+        ax1.legend()
+        ax1.grid(True)
+
+        # Plot C-index
+        ax2.plot(train_c_index, label='Training C-index')
+        ax2.plot(val_c_index, label='Validation C-index')
+        ax2.set_title('Training and Validation C-index')
+        ax2.set_xlabel('Epochs')
+        ax2.set_ylabel('C-index')
+        ax2.legend()
+        ax2.grid(True)
+
+        # Adjust layout to prevent overlap
+        plt.tight_layout()
+
+        # Save the figure
+        plt.savefig('DeepSurv_Loss_and_Cindex.png')
+
+    def plot_average_survival_curve(self, X_train):
+        survival_probabilities = self.predict(X_train)
+       
+        average_survival_curve = np.mean(survival_probabilities, axis=0)
+        
+        time_points = np.arange(0, 121, 6)  # 0 to 120 months (10 years) with 6-month increments
+        
+        #plt.figure(figsize=(10, 6))
+        plt.plot(time_points, average_survival_curve, color='blue', label='DeepSurv')
+        #plt.title('Average Survival Curve Predicted by DeepSurv Model')
+        #plt.xlabel('Time (months)')
+        #plt.ylabel('Survival Probability')
+        #plt.grid(True)
+        #plt.savefig('Average_Survival_Curve.png')
+        #plt.close()
+    
+    def save_model(self, path):
+        """
+        Save the model state dictionary and optimizer state
+        """
+        checkpoint = {
+            'model_state_dict': self.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'network_architecture': {
+                'n_in': self.network[0].in_features,
+                'hidden_layers_sizes': [layer.out_features for layer in self.network if isinstance(layer, nn.Linear)][:-1],
+                'activation': 'relu',  # You might want to make this dynamic based on your initialization
+                'dropout': self.network[2].p if any(isinstance(layer, nn.Dropout) for layer in self.network) else None
+            }
+        }
+        torch.save(checkpoint, path)
+
+    @classmethod
+    def load_model(cls, path):
+        """
+        Load a saved model
+        """
+        checkpoint = torch.load(path)
+        
+        # Create a new model instance with the saved architecture
+        arch = checkpoint['network_architecture']
+        model = cls(
+            n_in=arch['n_in'],
+            hidden_layers_sizes=arch['hidden_layers_sizes'],
+            activation=arch['activation'],
+            dropout=arch['dropout']
+        )
+        
+        # Load the saved state dictionaries
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        return model
+
+class DeepSurvIPCW(nn.Module):
+    def __init__(self, n_in, hidden_layers_sizes=None, activation='relu', dropout=None, lr=0.001):
+        super(DeepSurvIPCW, self).__init__()
+        
+        if hidden_layers_sizes is None:
+            hidden_layers_sizes = [64, 32]
+        
+        layers = []
+        prev_size = n_in
+        for size in hidden_layers_sizes:
+            layers.append(nn.Linear(prev_size, size))
+            if activation == 'relu':
+                layers.append(nn.ReLU())
+            elif activation == 'selu':
+                layers.append(nn.SELU())
+            if dropout is not None:
+                layers.append(nn.Dropout(dropout))
+            prev_size = size
+        
+        layers.append(nn.Linear(prev_size, 1))
+        self.network = nn.Sequential(*layers)
+        
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr, weight_decay=1e-5)
+    
+    def forward(self, x):
+        return self.network(x)
+    
+    def compute_ipcw_weights(self, X, C):
+        """
+        Compute the IPCW weights using a logistic regression model
+        that estimates the probability of censoring.
+        """
+        # Create a logistic regression model to predict the censoring probability
+        model = LogisticRegression(max_iter=1000)
+        
+        # Fit the model to the features and censoring indicator
+        model.fit(X, C.numpy())  # X is the feature matrix, C is the censoring indicator (0 or 1)
+        
+        # Predict the probability of censoring
+        censor_probs = model.predict_proba(X)[:, 1]  # Probability of being censored (P(C=1))
+        
+        # Compute IPCW weights: Inverse of the censoring probabilities
+        ipc_weights = 1.0 / censor_probs
+        return ipc_weights
+    
+    def _negative_log_likelihood(self, risk, E, T, ipc_weights):
+        sorted_indices = torch.argsort(T)
+        T_sorted = T[sorted_indices]
+        E_sorted = E[sorted_indices]
+        risk_sorted = risk[sorted_indices]
+
+        hazard_ratio = torch.exp(risk_sorted)
+        log_risk = torch.log(torch.cumsum(hazard_ratio, 0) + 1e-8)
+        uncensored_likelihood = risk_sorted - log_risk
+        censored_likelihood = uncensored_likelihood * E_sorted
+        num_observed_events = torch.sum(E_sorted)
+
+        # Including time factor (T) to model the risk more effectively
+        likelihood = censored_likelihood * T_sorted
+        
+        # Apply IPCW weights: Modify likelihood by multiplying with IPCW weights
+        weighted_likelihood = likelihood * ipc_weights[sorted_indices]
+        
+        # Return the negative log likelihood with IPCW correction
+        return -torch.sum(weighted_likelihood) / num_observed_events + 1e-8
+
+    def fit(self, X, T, C, X_val=None, T_val=None, C_val=None, epochs=80, batch_size=1800):
+        X = torch.FloatTensor(X)
+        T = torch.FloatTensor(T)
+        C = torch.FloatTensor(C)
+        
+        # Compute IPCW weights
+        ipc_weights = self.compute_ipcw_weights(X, C)
+        
+        dataset = torch.utils.data.TensorDataset(X, T, C)
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=True)
+        
+        train_losses = []
+        val_losses = []
+        
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', patience=10, verbose=True)
+        train_cindex = []
+        val_cindex = []
+        for epoch in range(epochs):
+            self.train()
+            epoch_loss = 0.0
+            for batch_X, batch_T, batch_C in dataloader:
+                self.optimizer.zero_grad()
+                risk = self(batch_X)
+                
+                # Compute IPCW weights for the batch
+                batch_ipc_weights = ipc_weights[batch_X.numpy().argmax(axis=1)]  # Select IPCW weights for the batch
+                
+                # Calculate the loss with IPCW
+                loss = self._negative_log_likelihood(risk, batch_C, batch_T, batch_ipc_weights)
+                loss.backward()
+                self.optimizer.step()
+                epoch_loss += loss.item()
+            
+            epoch_loss /= len(dataloader)
+            train_losses.append(epoch_loss)
+
+            # Compute C-index for the current batch
+            train_cindex_score = self.concordance_index(batch_T, batch_C, risk)
+            train_cindex.append(train_cindex_score)
+            
+            if X_val is not None and T_val is not None and C_val is not None:
+                self.eval()
+                with torch.no_grad():
+                    val_risk = self(torch.FloatTensor(X_val))
+                    val_ipc_weights = self.compute_ipcw_weights(X_val, C_val)
+                    val_loss = self._negative_log_likelihood(val_risk, torch.FloatTensor(C_val), torch.FloatTensor(T_val), val_ipc_weights)
+                    val_losses.append(val_loss.item())
+
+                    # Compute C-index for validation set
+                    val_cindex_score = self.concordance_index(T_val, C_val, val_risk)
+                    val_cindex.append(val_cindex_score)
+                
+                scheduler.step(val_loss)  # Step the scheduler after each epoch
+                print(f"Epoch {epoch+1}/{epochs}, Train Loss: {epoch_loss:.4f}, Val Loss: {val_loss:.4f}, "
+                      f"Val C-index: {val_cindex_score:.4f}")
+            else:
+                print(f"Epoch {epoch+1}/{epochs}, Train Loss: {epoch_loss:.4f}")
+        
+        self.plot_loss(train_losses, val_losses, train_cindex, val_cindex)
+
+    def concordance_index(self, T, C, risk):
+        """
+        Compute the concordance index (C-index) for the model predictions.
+        
+        Args:
+        - T: True event times (numpy array or torch tensor).
+        - C: Censoring indicators (numpy array or torch tensor).
+        - risk: The predicted risk scores (numpy array or torch tensor).
+
+        Returns:
+        - c_index: The concordance index (a float value between 0 and 1).
+        """
+        # Ensure T, C, risk are tensors
+        T = torch.tensor(T).float()
+        C = torch.tensor(C).float()
+        risk = torch.tensor(risk).float()
+        
+        # Initialize variables to count concordant, discordant, and tied pairs
+        concordant = 0
+        discordant = 0
+        tied = 0
+        n = len(T)
+        
+        # Compare every pair of individuals
+        for i in range(n):
+            for j in range(i+1, n):
+                if T[i] != T[j]:  # Only consider pairs where event times are different
+                    if C[i] == 1 and C[j] == 1:  # Both must be uncensored
+                        # Compare predicted risks and actual event times
+                        if risk[i] < risk[j] and T[i] < T[j]:
+                            concordant += 1
+                        elif risk[i] > risk[j] and T[i] > T[j]:
+                            concordant += 1
+                        else:
+                            discordant += 1
+                    elif C[i] == 1 or C[j] == 1:  # Handle censoring
+                        tied += 1
+        
+        # Compute the C-index: concordant / (concordant + discordant + tied)
+        c_index = concordant / (concordant + discordant + tied) if (concordant + discordant + tied) > 0 else 0
+        return c_index
